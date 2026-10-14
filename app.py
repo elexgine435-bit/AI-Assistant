@@ -7,7 +7,9 @@ and get an ATS score with concrete improvements.
 import io
 import json
 import os
+import random
 import re
+import time
 from typing import Optional
 
 import streamlit as st
@@ -15,6 +17,10 @@ from docx import Document
 from pypdf import PdfReader
 
 DEFAULT_MODEL = "gemini-3.5-flash"
+# Tried in order if the chosen model is overloaded or unavailable.
+FALLBACK_MODELS = ["gemini-3-flash-preview", "gemini-2.5-flash"]
+RETRIES_PER_MODEL = 3        # attempts per model for temporary errors
+BASE_DELAY_SECONDS = 2       # backoff: 2s, 4s, ... plus a little jitter
 MAX_RESUME_CHARS = 20000
 MAX_JD_CHARS = 8000
 MIN_TEXT_CHARS = 150  # below this we assume a scanned / image-only file
@@ -190,20 +196,63 @@ def normalize_result(data: dict) -> dict:
     }
 
 
-def analyze_with_gemini(api_key: str, model: str, resume_text: str, job_description: str) -> dict:
+def _error_code(exc: Exception) -> Optional[int]:
+    code = getattr(exc, "code", None)
+    if isinstance(code, int):
+        return code
+    match = re.match(r"\s*(\d{3})\b", str(exc))
+    return int(match.group(1)) if match else None
+
+
+def _is_transient(exc: Exception) -> bool:
+    """Temporary server-side problems worth retrying (overload, rate limit, timeouts)."""
+    if _error_code(exc) in (429, 500, 502, 503, 504):
+        return True
+    text = str(exc).upper()
+    return any(w in text for w in ("UNAVAILABLE", "OVERLOADED", "HIGH DEMAND", "RESOURCE_EXHAUSTED", "DEADLINE", "TIMEOUT"))
+
+
+def _is_fatal(exc: Exception) -> bool:
+    """Problems no retry or model switch will fix (bad key, no permission)."""
+    if _error_code(exc) in (401, 403):
+        return True
+    text = str(exc).upper()
+    return "API KEY" in text and ("INVALID" in text or "NOT VALID" in text)
+
+
+def analyze_with_gemini(api_key: str, model: str, resume_text: str, job_description: str,
+                        sleep=time.sleep) -> dict:
+    """Call Gemini with retries on temporary errors and fallback to other models."""
     from google import genai
     from google.genai import types
 
     client = genai.Client(api_key=api_key)
-    response = client.models.generate_content(
-        model=model,
-        contents=build_prompt(resume_text[:MAX_RESUME_CHARS], job_description[:MAX_JD_CHARS]),
-        config=types.GenerateContentConfig(
-            temperature=0.2,
-            response_mime_type="application/json",
-        ),
+    prompt = build_prompt(resume_text[:MAX_RESUME_CHARS], job_description[:MAX_JD_CHARS])
+    config = types.GenerateContentConfig(temperature=0.2, response_mime_type="application/json")
+
+    models = [model] + [m for m in FALLBACK_MODELS if m != model]
+    last_error: Optional[Exception] = None
+
+    for model_name in models:
+        for attempt in range(RETRIES_PER_MODEL):
+            try:
+                response = client.models.generate_content(model=model_name, contents=prompt, config=config)
+                return normalize_result(parse_json_response(response.text))
+            except ValueError as e:  # model returned unparseable JSON; retry once more
+                last_error = e
+            except Exception as e:
+                last_error = e
+                if _is_fatal(e):
+                    raise ValueError("Your Gemini API key was rejected. Check that it is correct and active.") from e
+                if not _is_transient(e):
+                    break  # e.g. model name not found: move on to the next model
+            if attempt < RETRIES_PER_MODEL - 1:
+                sleep(BASE_DELAY_SECONDS * (2 ** attempt) + random.uniform(0, 1))
+
+    raise ValueError(
+        "Gemini is busy or unavailable right now (all models and retries failed). "
+        f"Please try again in a minute. Last error: {last_error}"
     )
-    return normalize_result(parse_json_response(response.text))
 
 
 def blend_score(ai_score: int, rule_score: int) -> int:
@@ -274,7 +323,7 @@ def main() -> None:
                      "export a text-based PDF or DOCX instead. ATS systems can't read images either.")
             return
 
-        with st.spinner("Analyzing your resume..."):
+        with st.spinner("Analyzing your resume (may retry if Gemini is busy)..."):
             try:
                 ai = analyze_with_gemini(api_key, model.strip() or DEFAULT_MODEL, text, job_description.strip())
             except Exception as e:
