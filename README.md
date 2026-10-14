@@ -1,4 +1,3 @@
-# AI-Assistant
 # 📄 ATS Resume Checker
 
 A Streamlit app that scores a resume for ATS (Applicant Tracking System) friendliness and suggests specific improvements, powered by Google's Gemini Flash model.
@@ -28,6 +27,9 @@ Then run:
 ```bash
 streamlit run app.py
 ```
+
+## Handling "503 UNAVAILABLE / high demand" errors
+These come from Google's servers being overloaded, not from your code. The app automatically retries up to 3 times per model with increasing delays, then falls back to `gemini-3-flash-preview` and `gemini-2.5-flash`. If everything is busy it shows a friendly message, and trying again a minute later usually works. A rejected API key fails immediately with a clear message.
 
 ## Change the model
 The default is `gemini-3.5-flash`. Change it in the sidebar, or set the `GEMINI_MODEL` environment variable. If Google renames or retires a model, use any current Flash model name from the Gemini API docs.
